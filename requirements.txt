@@ -1,0 +1,26 @@
+# 核心框架
+fastapi>=0.136.0
+uvicorn>=0.46.0
+httpx>=0.28.1
+python-dotenv>=1.2.2
+
+# LangChain 框架
+langchain>=0.2.17
+langchain-core>=0.2.43
+langchain-openai>=0.1.25
+langchain-community>=0.2.17
+
+# 记忆系统
+chromadb>=1.5.8
+sentence-transformers>=2.2.0
+
+# 图片识别
+dashscope>=1.25.17
+
+# 网页抓取
+requests>=2.33.1
+beautifulsoup4>=4.14.3
+lxml>=6.1.0
+
+# QQ 空间
+pycryptodome

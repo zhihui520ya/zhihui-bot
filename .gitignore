@@ -1,0 +1,32 @@
+# 运行环境
+venv/
+.env
+bot.log
+*.log
+
+# 数据存储（用户聊天记录、向量库）
+memories/
+vector_store/
+
+# 模型文件
+bge_model/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
