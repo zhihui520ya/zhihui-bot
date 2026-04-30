@@ -446,3 +446,7 @@ ADMIN_QQ=你的QQ号
 - 回复速度过快 → 添加字符数延迟
 - 编码问题（Unicode/GBK） → 添加异常处理
 - NapCat 连接超时 → 确认 webhook 地址为 WSL 内网 IP
+
+## 依赖
+
+本项目依赖 [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 作为 QQ 消息收发中间件，需先部署 NapCat 并配置 webhook 指向本服务。
