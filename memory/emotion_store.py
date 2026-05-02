@@ -210,12 +210,12 @@ async def set_session_emotion(session_id, emotion_dict, reasons_dict=None, last_
         _set_session_emotion_no_lock(session_id, emotion_dict, reasons_dict, last_message_time)
 
 
-async def update_session_emotion(session_id, emotion_name, delta, max_val=10, reason=None):
+async def update_session_emotion(session_id, emotion_name, delta, max_val=100, reason=None):
     """
     对某个情绪维度增加 delta，并限制最大强度。
     reason: 引起该情绪变化的原因（可选）
 
-    自动维护 anchored_labels：如果更新后值 ≥7，将该标签加入锚点标签列表
+    自动维护 anchored_labels：如果更新后值 ≥70，将该标签加入锚点标签列表
     自动清理原因：如果值归零，同时清除对应原因
     """
     async with await _get_session_lock(session_id):
@@ -233,7 +233,7 @@ async def update_session_emotion(session_id, emotion_name, delta, max_val=10, re
 
         # 检查是否需要记录锚点标签
         clamped_val = min(max_val, new_val)
-        if clamped_val >= 7:
+        if clamped_val >= 70:
             _record_anchor_label_no_lock(session_id, emotion_name)
 
 
@@ -253,7 +253,7 @@ async def get_anchored_labels(session_id):
 
 
 async def record_anchor_label(session_id, emotion_label):
-    """确保某情绪标签被记录为锚点（曾达到过 ≥7）"""
+    """确保某情绪标签被记录为锚点（曾达到过 ≥70）"""
     async with await _get_session_lock(session_id):
         _record_anchor_label_no_lock(session_id, emotion_label)
 

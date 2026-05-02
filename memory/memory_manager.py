@@ -7,17 +7,14 @@ import datetime
 import sqlite3
 import shutil
 import threading
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
-from langchain_openai import ChatOpenAI
-from memory import get_vector_store  # 现有向量库
 from config import DATA_DIR
 
 # ========== 配置常量 ==========
 SHORT_TERM_MAX_ROUNDS = 50          # 最大轮数（AI 回复数）
-SHORT_TERM_MIN_ROUNDS = 30          # 最小轮数阈值（只有达到此轮数才总结）
+SHORT_TERM_MIN_ROUNDS = 50          # 最小轮数阈值（只有达到此轮数才总结）
 SHORT_TERM_CACHE_DIR = os.path.join(DATA_DIR, "memories", "short_term_cache")
-LONG_TERM_MAX_PROCESSED_FILE = os.path.join(DATA_DIR, "memories", "max_processed.json")
 
 # ========== 短期记忆类 ==========
 class ShortTermMemory:
@@ -29,6 +26,8 @@ class ShortTermMemory:
         self.session_id = session_id
         self.db_path = os.path.join(DATA_DIR, "memories", f"{session_id}.db")
         self.lock = threading.Lock()
+        self._summarizing = False
+        self._llm = None
         self._ensure_db()
 
     def _ensure_db(self):
@@ -52,6 +51,10 @@ class ShortTermMemory:
                 pass  # 列已存在
             conn.commit()
             conn.close()
+
+    def set_llm(self, llm_instance):
+        """注入 LLM 实例，用于自动轮数总结"""
+        self._llm = llm_instance
 
     def update_message_content(self, napcat_msg_id: int, new_content: str) -> bool:
         """根据 NapCat message_id 更新已存储消息的内容"""
@@ -158,8 +161,22 @@ class ShortTermMemory:
                 (self.session_id, msg_json, napcat_msg_id)
             )
 
+        # 自动轮数总结触发（在锁释放后执行，不阻塞主流程）
+        if self._llm is not None and not self._summarizing:
+            rounds = self.get_total_rounds()
+            if rounds >= SHORT_TERM_MIN_ROUNDS:
+                self._summarizing = True
+                path = self.export_to_file()
+                self.clear()
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.ensure_future(self._do_summarize(path))
+                except RuntimeError:
+                    pass
+
     def _format_time_tag(self, created_at) -> str:
-        """将 created_at 格式化为时间标签，如 [04-30 08:00]"""
+        """将 created_at 格式化为时间后缀，如 （04-30 08:00）"""
         if not created_at:
             return ""
         try:
@@ -169,31 +186,31 @@ class ShortTermMemory:
                 dt = datetime.datetime.fromtimestamp(created_at)
             else:
                 return ""
-            return dt.strftime("[%m-%d %H:%M] ")
+            return dt.strftime("（%m-%d %H:%M）")
         except Exception:
             return ""
 
-    def get_recent_messages(self, k: int = 50) -> List[BaseMessage]:
-        """获取最近 k 条消息（按时间正序），每条附带时间标签"""
+    def get_recent_messages(self, k: int = 30) -> List[BaseMessage]:
+        """获取最近 k 条消息（按时间正序）。"""
+        messages = []
         rows = self._execute(
             "SELECT message, created_at FROM message_store ORDER BY id DESC LIMIT ?",
             (k,), fetchall=True
         )
-        messages = []
         for row in rows:
             msg_data = json.loads(row['message'])
             content = msg_data['data']['content']
             additional_kwargs = msg_data['data'].get('additional_kwargs', {})
-            time_tag = self._format_time_tag(row.get('created_at'))
+            time_tag = self._format_time_tag(row['created_at'])
             if msg_data['type'] == 'human':
                 uid = additional_kwargs.get('user_id')
                 if uid:
-                    display_content = f"{time_tag}[{uid}] {content}"
+                    display_content = f"[{uid}] {content} {time_tag}"
                 else:
-                    display_content = f"{time_tag}{content}"
+                    display_content = f"{content} {time_tag}"
                 messages.append(HumanMessage(content=display_content))
             elif msg_data['type'] == 'ai':
-                messages.append(AIMessage(content=f"{time_tag}{content}"))
+                messages.append(AIMessage(content=f"{content} {time_tag}"))
         # 返回顺序为正序（最早的在前）
         messages.reverse()
         return messages
@@ -238,6 +255,38 @@ class ShortTermMemory:
         """清空短期库"""
         self._execute("DELETE FROM message_store")
 
+    def delete_last_n(self, n: int = 1):
+        """删除最近 N 条消息"""
+        self._execute(
+            "DELETE FROM message_store WHERE id IN (SELECT id FROM message_store ORDER BY id DESC LIMIT ?)",
+            (n,),
+        )
+
+    def delete_by_user_id(self, user_id: str, limit: int | None = None) -> int:
+        """删除指定用户的消息（根据 user_id）。返回删除条数。"""
+        with self.lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            try:
+                if limit is not None:
+                    cursor = conn.execute(
+                        """DELETE FROM message_store WHERE id IN (
+                            SELECT id FROM message_store
+                            WHERE json_extract(message, '$.data.additional_kwargs.user_id') = ?
+                            ORDER BY id DESC LIMIT ?
+                        )""",
+                        (user_id, limit),
+                    )
+                else:
+                    cursor = conn.execute(
+                        "DELETE FROM message_store WHERE json_extract(message, '$.data.additional_kwargs.user_id') = ?",
+                        (user_id,),
+                    )
+                deleted = cursor.rowcount
+                conn.commit()
+            finally:
+                conn.close()
+            return deleted
+
     def export_to_file(self, timestamp: int = None):
         """导出当前数据库到缓存目录"""
         os.makedirs(SHORT_TERM_CACHE_DIR, exist_ok=True)
@@ -247,133 +296,50 @@ class ShortTermMemory:
         shutil.copy2(self.db_path, dest)
         return dest
 
-    async def summarize_and_store(self, llm: ChatOpenAI):
-        """调用 LLM 生成摘要，存入向量库，然后清空短期库"""
-        rows = self._execute(
-            "SELECT message, created_at FROM message_store ORDER BY id",
-            fetchall=True
-        )
-        if not rows:
-            return
-        conversation_text = []
-        for row in rows:
-            msg_data = json.loads(row['message'])
-            role = msg_data['type']
-            content = msg_data['data']['content']
-            created_at = row['created_at']
-            if isinstance(created_at, str):
-                dt = datetime.datetime.fromisoformat(created_at)
-            else:
-                dt = created_at
-            time_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-            conversation_text.append(f"{role}: {content}")
-        full_text = "\n".join(conversation_text)
+    async def _do_summarize(self, snapshot_path: str):
+        """从快照文件中读取对话，LLM 总结后存入向量库，删除快照。"""
+        try:
+            snap_conn = sqlite3.connect(snapshot_path, check_same_thread=False)
+            rows = snap_conn.execute(
+                "SELECT message, created_at FROM message_store ORDER BY id"
+            ).fetchall()
+            snap_conn.close()
 
-        prompt = f"""请根据以下对话内容，生成一段简短的摘要（200字以内），概括主要话题和关键信息：
+            if not rows:
+                os.remove(snapshot_path)
+                return
+
+            conversation_text = []
+            for row in rows:
+                msg_data = json.loads(row[0])
+                role = msg_data['type']
+                content = msg_data['data']['content']
+                conversation_text.append(f"{role}: {content}")
+            full_text = "\n".join(conversation_text)
+
+            prompt = f"""请根据以下对话内容，生成一段简短的摘要（200字以内），概括主要话题和关键信息：
 {full_text}
 
 摘要："""
-        try:
-            response = await llm.ainvoke(prompt)
+            response = await self._llm.ainvoke(prompt)
             summary = response.content.strip()
-            vector_store = get_vector_store()
-            max_id = await vector_store.get_max_id(self.session_id) or 0
-            new_id = max_id + 1
-            await vector_store.add_summary(self.session_id, new_id, summary, metadata={
+
+            from memory import get_vector_store
+            vs = get_vector_store()
+            max_id = await vs.get_max_id(self.session_id) or 0
+            new_id = int(max_id) + 1
+            await vs.add_summary(self.session_id, str(new_id), summary, metadata={
                 "type": "summary",
                 "timestamp": int(time.time()),
-                "source": "short_term_summary"
+                "source": "short_term_summary",
             })
-            print(f"[记忆] 已生成摘要，编号 {new_id}，存入向量库")
+            print(f"[记忆] 轮数总结完成: {new_id}")
+            os.remove(snapshot_path)
+            print(f"[记忆] 已删除快照: {snapshot_path}")
         except Exception as e:
-            print(f"[记忆] 总结失败: {e}")
+            print(f"[记忆] 轮数总结失败: {e}")
         finally:
-            self.clear()
-            print(f"[记忆] 短期库已清空 (session: {self.session_id})")
-
-
-# ========== 长期记忆管理（向量库整理） ==========
-class LongTermMemory:
-    def __init__(self):
-        self.vector_store = get_vector_store()
-        self.lock = threading.Lock()
-
-    def get_max_processed(self, session_id: str) -> int:
-        """获取最后一次整理的最大编号"""
-        if os.path.exists(LONG_TERM_MAX_PROCESSED_FILE):
-            with open(LONG_TERM_MAX_PROCESSED_FILE, 'r') as f:
-                data = json.load(f)
-                return data.get(session_id, 0)
-        return 0
-
-    def set_max_processed(self, session_id: str, value: int):
-        """保存最大编号"""
-        data = {}
-        if os.path.exists(LONG_TERM_MAX_PROCESSED_FILE):
-            with open(LONG_TERM_MAX_PROCESSED_FILE, 'r') as f:
-                data = json.load(f)
-        data[session_id] = value
-        with open(LONG_TERM_MAX_PROCESSED_FILE, 'w') as f:
-            json.dump(data, f)
-
-    async def incremental_organize(self, session_id: str, llm: ChatOpenAI):
-        """增量整理该会话的向量库段落"""
-        max_processed = self.get_max_processed(session_id)
-        all_ids = await self.vector_store.get_all_ids(session_id)
-        if not all_ids:
-            return
-        # 过滤出编号大于 max_processed 的 id（id 是数字字符串）
-        pending_ids = [id for id in all_ids if id.isdigit() and int(id) > max_processed]
-        if not pending_ids:
-            return
-        pending_ids.sort(key=int)
-        # 获取这些段落的内容和元数据
-        paragraphs = await self.vector_store.get_by_ids(session_id, pending_ids)
-        texts = []
-        for para in paragraphs:
-            texts.append(f"编号 {para['id']}: {para['document']}")
-        full_text = "\n".join(texts)
-
-        prompt = f"""你是一个记忆整理助手。以下是某个对话会话的多个记忆段落，每个段落有编号和内容。
-请根据话题相似性将这些段落分组，每组生成一段新的总结（保留关键信息，避免信息丢失）。返回结果必须是 JSON 格式，示例如下：
-[
-  {{"start_id": 1, "end_id": 3, "summary": "新总结内容..."}},
-  {{"start_id": 4, "end_id": 5, "summary": "新总结内容..."}}
-]
-注意：组必须覆盖所有段落，编号区间必须连续（如 1-3），且不能重叠。如果某个段落与其他都不同，可单独成组（start_id = end_id = 该编号）。
-
-待整理段落：
-{full_text}
-
-请返回 JSON 列表："""
-        try:
-            response = await llm.ainvoke(prompt)
-            result_text = response.content.strip()
-            import re
-            json_match = re.search(r'\[\s*\{.*\}\s*\]', result_text, re.DOTALL)
-            if json_match:
-                groups = json.loads(json_match.group())
-            else:
-                raise ValueError("未找到 JSON")
-            # 更新向量库
-            for group in groups:
-                start = group['start_id']
-                end = group['end_id']
-                summary = group['summary']
-                ids_to_delete = [str(i) for i in range(start, end+1)]
-                await self.vector_store.delete_by_ids(session_id, ids_to_delete)
-                new_id = start
-                await self.vector_store.add_summary(session_id, new_id, summary, metadata={
-                    "type": "organized_summary",
-                    "timestamp": int(time.time())
-                })
-            # 更新 max_processed 为本次处理的最大原始编号
-            max_processed = max(pending_ids, key=int)
-            self.set_max_processed(session_id, max_processed)
-            print(f"[记忆] 增量整理完成，session: {session_id}, 处理到编号 {max_processed}")
-        except Exception as e:
-            print(f"[记忆] 增量整理失败: {e}")
-
+            self._summarizing = False
 
 # ========== 话题切换检测 ==========
 def detect_topic_switch(short_term: ShortTermMemory, current_input: str,

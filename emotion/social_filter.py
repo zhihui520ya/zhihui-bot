@@ -8,7 +8,7 @@
 使用方式：
     state = CognitiveResourceManager.get(session_id)
     state.update_capacity(affection)
-    filtered, _ = apply_social_filter(emotions, reasons, user_emotion, state)
+    filtered, _, narrative = apply_social_filter(emotions, reasons, user_emotion, state, affection)
     CognitiveResourceManager.save(session_id)
 """
 
@@ -38,6 +38,7 @@ RECOVERY_RATE_PER_SEC = COGNITIVE_RECOVERY_RATE
 # 爆发阈值
 BURST_THRESHOLD = COGNITIVE_BURST_THRESHOLD
 BURST_EXIT_THRESHOLD = COGNITIVE_BURST_EXIT_THRESHOLD
+BURST_COOLDOWN = 36 * 3600  # 36小时爆发冷却
 
 STORAGE_DIR = os.path.join(DATA_DIR, "memories", "cognitive_resources")
 
@@ -51,32 +52,24 @@ STORAGE_DIR = os.path.join(DATA_DIR, "memories", "cognitive_resources")
 
 DISGUISE_RULES = [
     {
-        "name": "不熟_醋意掩饰为冷漠",
-        "condition": lambda e, a: e.get("醋意", 0) >= 7 and 0 <= a < 3000,
+        "name": "不熟_恐惧掩饰为愤怒",
+        "condition": lambda e, a: e.get("恐惧", 0) >= 70 and 0 <= a < 3000,
         "skip_suppression": None,
         "transform": lambda expressed, orig: {
             **expressed,
-            "醋意": round(orig.get("醋意", 0) * 0.3, 1),
-            "生气": expressed.get("生气", 0) + round(orig.get("醋意", 0) * 0.4, 1),
+            "恐惧": round(orig.get("恐惧", 0) * 0.3, 1),
+            "愤怒": expressed.get("愤怒", 0) + round(orig.get("恐惧", 0) * 0.4, 1),
         },
-        "cost": 0.08,
+        "cost": 0.4,
     },
     {
         "name": "信任_直接表达脆弱",
-        "condition": lambda e, a: e.get("委屈", 0) >= 6 and a > 7000,
-        "skip_suppression": {"委屈"},
+        "condition": lambda e, a: e.get("悲伤", 0) >= 60 and a > 7000,
+        "skip_suppression": {"悲伤"},
         "transform": None,
-        "cost": -0.03,
+        "cost": -0.15,
     },
 ]
-
-
-def _reverse_affection(max_capacity: float) -> float:
-    """从 max_capacity 反推好感度（与 update_capacity 互逆）"""
-    if RESOURCE_CAPACITY_MAX <= RESOURCE_CAPACITY_MIN:
-        return 0.0
-    ratio = (max_capacity - RESOURCE_CAPACITY_MIN) / (RESOURCE_CAPACITY_MAX - RESOURCE_CAPACITY_MIN)
-    return ratio * 10000
 
 
 class CognitiveResourceState:
@@ -84,12 +77,14 @@ class CognitiveResourceState:
     __slots__ = (
         'session_id', 'current', 'max_capacity',
         'last_update', 'suppression_count', 'burst_mode',
+        'last_burst_at',
     )
 
     def __init__(
         self, session_id: str, current: float = 60.0,
         max_capacity: float = 60.0, last_update: float = 0.0,
         suppression_count: int = 0, burst_mode: bool = False,
+        last_burst_at: float = 0.0,
     ):
         self.session_id = session_id
         self.current = current
@@ -97,6 +92,7 @@ class CognitiveResourceState:
         self.last_update = last_update
         self.suppression_count = suppression_count
         self.burst_mode = burst_mode
+        self.last_burst_at = last_burst_at
 
     def recover(self):
         """随时间恢复认知资源"""
@@ -111,9 +107,11 @@ class CognitiveResourceState:
     def update_capacity(self, affection: float):
         """根据好感度更新最大容量"""
         norm = affection / 10000  # 0~10000 → 0~1
+        # 好感度低→容量大（更克制、更会装）
+        # 好感度高→容量小（容易装累→爆发→真情流露）
         self.max_capacity = (
-            RESOURCE_CAPACITY_MIN
-            + norm * (RESOURCE_CAPACITY_MAX - RESOURCE_CAPACITY_MIN)
+            RESOURCE_CAPACITY_MAX
+            - norm * (RESOURCE_CAPACITY_MAX - RESOURCE_CAPACITY_MIN)
         )
         self.current = min(self.current, self.max_capacity)
 
@@ -128,6 +126,7 @@ class CognitiveResourceState:
             "last_update": self.last_update,
             "suppression_count": self.suppression_count,
             "burst_mode": self.burst_mode,
+            "last_burst_at": self.last_burst_at,
         }
 
     @classmethod
@@ -139,6 +138,7 @@ class CognitiveResourceState:
             last_update=d["last_update"],
             suppression_count=d.get("suppression_count", 0),
             burst_mode=d.get("burst_mode", False),
+            last_burst_at=d.get("last_burst_at", 0.0),
         )
 
 
@@ -183,22 +183,141 @@ class CognitiveResourceManager:
             json.dump(state.to_dict(), f)
 
 
+def _affection_scale(affection: float, low: float, high: float) -> float:
+    """好感度 0~10000 → 低值~高值 线性插值。好感越低越抑制（低值），好感越高越真实（高值）"""
+    norm = min(1.0, affection / 10000)
+    return low + (high - low) * norm
+
+
+# ========== 傲娇抑制 → 行为描述词汇 ==========
+
+_SUPPRESSION_NARRATIVES = {
+    "快乐": {
+        "inner": {
+            (0, 20): "心情一般",
+            (20, 40): "心情还行",
+            (40, 60): "心里有点高兴",
+            (60, 80): "其实挺开心的",
+            (80, float("inf")): "内心超开心的",
+        },
+        "cover": [
+            "但故意装作不在意的样子",
+            "但板着脸说'还行吧'",
+            "但嘴上说'才没有呢'",
+            "但假装不是很在意",
+        ],
+    },
+    "悲伤": {
+        "inner": {
+            (0, 20): "没什么",
+            (20, 40): "稍微有点低落",
+            (40, 60): "有点难受",
+            (60, 80): "其实挺难过的",
+            (80, float("inf")): "心里很难受",
+        },
+        "cover": [
+            "但假装没事",
+            "但强颜欢笑",
+            "但笑着说'我没事'",
+        ],
+    },
+    "恐惧": {
+        "inner": {
+            (0, 20): "没什么好怕的",
+            (20, 40): "稍微有点在意",
+            (40, 60): "其实有点不安",
+            (60, 80): "其实挺害怕的",
+            (80, float("inf")): "内心很害怕",
+        },
+        "cover": [
+            "但强装镇定",
+            "但故作坚强",
+            "但嘴硬说'谁怕了'",
+        ],
+    },
+    "愤怒": {
+        "inner": {
+            (0, 20): "没什么",
+            (20, 40): "稍微有点不爽",
+            (40, 60): "有点烦躁",
+            (60, 80): "其实有点生气",
+            (80, float("inf")): "其实非常生气",
+        },
+        "cover": [
+            "但努力保持冷静",
+            "但压住了火气",
+            "但假装没在生气",
+        ],
+    },
+    "惊讶": {
+        "inner": {
+            (0, 20): "没什么特别的",
+            (20, 40): "有点意外",
+            (40, 60): "确实没想到",
+            (60, 80): "确实被惊到了",
+            (80, float("inf")): "完全出乎意料",
+        },
+        "cover": [
+            "但装作没什么大不了的",
+            "但表面上一脸平静",
+            "但故作淡定地说'哦'",
+        ],
+    },
+    "厌恶": {
+        "inner": {
+            (0, 20): "没什么",
+            (20, 40): "有点不舒服",
+            (40, 60): "不太喜欢",
+            (60, 80): "其实挺反感的",
+            (80, float("inf")): "非常讨厌",
+        },
+        "cover": [
+            "但忍住了没说",
+            "但装作无所谓的样子",
+            "但压下了那股情绪",
+        ],
+    },
+}
+
+
+def _pick_narrative(emotion: str, raw_val: float) -> str:
+    """根据原始情绪强度选取内心描述"""
+    ranges = _SUPPRESSION_NARRATIVES.get(emotion, {}).get("inner", {})
+    for (lo, hi), text in sorted(ranges.items()):
+        if lo <= raw_val < hi:
+            return text
+    return ""
+
+
+def _pick_cover(emotion: str) -> str:
+    """随机选取一种傲娇行为表现"""
+    covers = _SUPPRESSION_NARRATIVES.get(emotion, {}).get("cover", [])
+    import random
+    return random.choice(covers) if covers else "但不想表现出来"
+
+
 def apply_social_filter(
     emotions: dict,
     reasons: dict,
     user_emotions: list[str],
     state: CognitiveResourceState,
-) -> tuple[dict, dict]:
+    affection: float = 0.0,
+) -> tuple[dict, dict, str]:
     """
     对内部情绪施加社交过滤器。
 
-    返回 (filtered_emotions, filtered_reasons)
+    返回 (expressed_emotions, expressed_reasons, narrative)
+      - expressed_emotions: 抑制后的情绪值（供其他系统使用）
+      - expressed_reasons: 对应原因
+      - narrative: 本地生成的傲娇行为描述文本，供 LLM 使用
 
-    傲娇过滤规则:
-    1. 害羞 >= 3 -> 抑制 50%，补偿撒娇 +1
-    2. 开心 >= 4 且被夸(用户情绪含"害羞") -> 降级(开心-2 -> 害羞+1)
-    3. 醋意 >= 3 -> 抑制 40%
-    4. 委屈 >= 6 -> 抑制 50%，假装没事
+    傲娇过滤规则（所有抑制比例按好感度动态计算）:
+    1. 快乐 >= 40 且被夸 → 快乐×0.4~0.8，惊讶+0.1~0.3
+    2. 悲伤 >= 60 → 悲伤×0.3~0.7，愤怒+0.1~0.3（藏悲→烦躁）
+    3. 恐惧 >= 40 → 恐惧×0.4~0.7，愤怒+0.1~0.3（虚张声势）
+    4. 愤怒 >= 60 → 愤怒×0.5~0.8，恐惧+0.0~0.2（压下火气后不安）
+    5. 惊讶 >= 40 → 惊讶×0.5~0.8，快乐+0.1~0.2（故作淡定）
+    6. 厌恶 >= 40 → 厌恶×0.4~0.7，愤怒+0.1~0.3（忍着不说）
     """
     state.recover()
     ratio = state.ratio
@@ -206,30 +325,39 @@ def apply_social_filter(
     expressed = dict(emotions)
     exp_reasons = dict(reasons)
     total_cost = 0.0
+    narrative_parts = []  # 收集行为描述片段
 
     # ---- 爆发检测与处理 ----
     if state.burst_mode and ratio > BURST_EXIT_THRESHOLD:
         state.burst_mode = False
         print(f"[社交过滤器] 资源恢复({ratio:.0%})，退出爆发模式")
 
+    _can_burst = (time.time() - state.last_burst_at) >= BURST_COOLDOWN
     in_burst = state.burst_mode or (
-        ratio <= BURST_THRESHOLD and state.suppression_count > 0
+        ratio <= BURST_THRESHOLD and state.suppression_count > 0 and _can_burst
     )
 
     if in_burst:
         if not state.burst_mode:
             print(f"[社交过滤器] 资源耗尽({ratio:.0%})，进入爆发模式")
             state.burst_mode = True
-        # 爆发模式：不抑制，增强表达 1.5 倍
+        state.last_burst_at = time.time()
+        # 爆发模式：不抑制，正负情绪区分倍数
+        _positive_emotions = {"快乐", "惊讶"}
         for k in list(expressed.keys()):
-            expressed[k] = min(10, expressed[k] * 1.5)
+            if k in _positive_emotions:
+                expressed[k] = min(100, expressed[k] * 1.3)
+            else:
+                expressed[k] = min(100, expressed[k] * 1.5)
         state.suppression_count += 1
         print(f"[社交过滤器] 爆发: {dict(emotions)} -> {expressed}")
         _cleanup(expressed, exp_reasons)
-        return expressed, exp_reasons
+        narrative_parts.append("情绪压不住了，全部涌了出来")
+        narrative = "，".join(narrative_parts) if narrative_parts else ""
+        print(f"[社交过滤器] 爆发描述: {narrative}")
+        return expressed, exp_reasons, narrative
 
     # ---- 伪装规则预检查：跳过抑制 ----
-    affection = _reverse_affection(state.max_capacity)
     skip_suppression_labels: set[str] = set()
     for rule in DISGUISE_RULES:
         if rule.get("skip_suppression") and rule["condition"](emotions, affection):
@@ -239,37 +367,85 @@ def apply_social_filter(
                 f" → 跳过 {rule['skip_suppression']} 的抑制"
             )
 
-    # ---- 正常抑制（检查跳过标签） ----
+    # ---- 正常抑制（检查跳过标签），动态比例 ----
 
-    # 规则 1: 害羞 >= 3 抑制 50%，补撒娇
-    if "害羞" not in skip_suppression_labels and expressed.get("害羞", 0) >= 3:
-        v = expressed["害羞"]
-        expressed["害羞"] = round(v * 0.5, 1)
-        expressed["撒娇"] = expressed.get("撒娇", 0) + 1
-        total_cost += 0.05
-        print(f"[社交过滤器] 害羞 {v:.1f}->{expressed['害羞']:.1f}，撒娇+1")
+    # 规则 1: 快乐 >= 40 且被夸 -> 傲娇否认
+    if "快乐" not in skip_suppression_labels and expressed.get("快乐", 0) >= 40 and "快乐" in user_emotions:
+        raw = expressed["快乐"]
+        scale = _affection_scale(affection, 0.4, 0.8)
+        expressed["快乐"] = round(raw * scale, 1)
+        comp = round(_affection_scale(affection, 0.1, 0.3), 1)
+        expressed["惊讶"] = expressed.get("惊讶", 0) + comp
+        total_cost += 0.4
+        inner_text = _pick_narrative("快乐", raw)
+        cover_text = _pick_cover("快乐")
+        narrative_parts.append(f"{inner_text}，{cover_text}")
+        print(f"[社交过滤器] 快乐 {raw:.1f}×{scale:.2f}->{expressed['快乐']:.1f}，惊讶+{comp}")
 
-    # 规则 2: 开心 >= 4 且被夸(用户情绪含害羞) -> 傲娇否认
-    if "开心" not in skip_suppression_labels and expressed.get("开心", 0) >= 4 and "害羞" in user_emotions:
-        v = expressed["开心"]
-        expressed["开心"] = max(1, v - 2)
-        expressed["害羞"] = expressed.get("害羞", 0) + 1
-        total_cost += 0.08
-        print(f"[社交过滤器] 开心 {v:.1f}->{expressed['开心']:.1f}，害羞+1")
+    # 规则 2: 悲伤 >= 60 -> 假装没事
+    if "悲伤" not in skip_suppression_labels and expressed.get("悲伤", 0) >= 60:
+        raw = expressed["悲伤"]
+        scale = _affection_scale(affection, 0.3, 0.7)
+        expressed["悲伤"] = round(raw * scale, 1)
+        comp = round(_affection_scale(affection, 0.1, 0.3), 1)
+        expressed["愤怒"] = expressed.get("愤怒", 0) + comp
+        total_cost += 0.2
+        inner_text = _pick_narrative("悲伤", raw)
+        cover_text = _pick_cover("悲伤")
+        narrative_parts.append(f"{inner_text}，{cover_text}")
+        print(f"[社交过滤器] 悲伤 {raw:.1f}×{scale:.2f}->{expressed['悲伤']:.1f}，愤怒+{comp}")
 
-    # 规则 3: 醋意 >= 3 抑制 40%
-    if "醋意" not in skip_suppression_labels and expressed.get("醋意", 0) >= 3:
-        v = expressed["醋意"]
-        expressed["醋意"] = round(v * 0.6, 1)
-        total_cost += 0.06
-        print(f"[社交过滤器] 醋意 {v:.1f}->{expressed['醋意']:.1f}")
+    # 规则 3: 恐惧 >= 40 -> 虚张声势
+    if "恐惧" not in skip_suppression_labels and expressed.get("恐惧", 0) >= 40:
+        raw = expressed["恐惧"]
+        scale = _affection_scale(affection, 0.4, 0.7)
+        expressed["恐惧"] = round(raw * scale, 1)
+        comp = round(_affection_scale(affection, 0.1, 0.3), 1)
+        expressed["愤怒"] = expressed.get("愤怒", 0) + comp
+        total_cost += 0.3
+        inner_text = _pick_narrative("恐惧", raw)
+        cover_text = _pick_cover("恐惧")
+        narrative_parts.append(f"{inner_text}，{cover_text}")
+        print(f"[社交过滤器] 恐惧 {raw:.1f}×{scale:.2f}->{expressed['恐惧']:.1f}，愤怒+{comp}")
 
-    # 规则 4: 委屈 >= 6 抑制 50%
-    if "委屈" not in skip_suppression_labels and expressed.get("委屈", 0) >= 6:
-        v = expressed["委屈"]
-        expressed["委屈"] = round(v * 0.5, 1)
-        total_cost += 0.04
-        print(f"[社交过滤器] 委屈 {v:.1f}->{expressed['委屈']:.1f}")
+    # 规则 4: 愤怒 >= 60 -> 压住火气
+    if "愤怒" not in skip_suppression_labels and expressed.get("愤怒", 0) >= 60:
+        raw = expressed["愤怒"]
+        scale = _affection_scale(affection, 0.5, 0.8)
+        expressed["愤怒"] = round(raw * scale, 1)
+        comp = round(_affection_scale(affection, 0.0, 0.2), 1)
+        expressed["恐惧"] = expressed.get("恐惧", 0) + comp
+        total_cost += 0.2
+        inner_text = _pick_narrative("愤怒", raw)
+        cover_text = _pick_cover("愤怒")
+        narrative_parts.append(f"{inner_text}，{cover_text}")
+        print(f"[社交过滤器] 愤怒 {raw:.1f}×{scale:.2f}->{expressed['愤怒']:.1f}，恐惧+{comp}")
+
+    # 规则 5: 惊讶 >= 40 -> 故作淡定
+    if "惊讶" not in skip_suppression_labels and expressed.get("惊讶", 0) >= 40:
+        raw = expressed["惊讶"]
+        scale = _affection_scale(affection, 0.5, 0.8)
+        expressed["惊讶"] = round(raw * scale, 1)
+        comp = round(_affection_scale(affection, 0.1, 0.2), 1)
+        expressed["快乐"] = expressed.get("快乐", 0) + comp
+        total_cost += 0.2
+        inner_text = _pick_narrative("惊讶", raw)
+        cover_text = _pick_cover("惊讶")
+        narrative_parts.append(f"{inner_text}，{cover_text}")
+        print(f"[社交过滤器] 惊讶 {raw:.1f}×{scale:.2f}->{expressed['惊讶']:.1f}，快乐+{comp}")
+
+    # 规则 6: 厌恶 >= 40 -> 忍着不说
+    if "厌恶" not in skip_suppression_labels and expressed.get("厌恶", 0) >= 40:
+        raw = expressed["厌恶"]
+        scale = _affection_scale(affection, 0.4, 0.7)
+        expressed["厌恶"] = round(raw * scale, 1)
+        comp = round(_affection_scale(affection, 0.1, 0.3), 1)
+        expressed["愤怒"] = expressed.get("愤怒", 0) + comp
+        total_cost += 0.3
+        inner_text = _pick_narrative("厌恶", raw)
+        cover_text = _pick_cover("厌恶")
+        narrative_parts.append(f"{inner_text}，{cover_text}")
+        print(f"[社交过滤器] 厌恶 {raw:.1f}×{scale:.2f}->{expressed['厌恶']:.1f}，愤怒+{comp}")
 
     # ---- 伪装规则后处理：变换 ----
     for rule in DISGUISE_RULES:
@@ -292,10 +468,12 @@ def apply_social_filter(
     )
 
     _cleanup(expressed, exp_reasons)
-    # 确保所有情绪不超过上限 10
     for k in list(expressed.keys()):
-        expressed[k] = min(10, expressed[k])
-    return expressed, exp_reasons
+        expressed[k] = min(100, expressed[k])
+
+    # 组装最终描述
+    narrative = "，".join(narrative_parts) if narrative_parts else ""
+    return expressed, exp_reasons, narrative
 
 
 def _cleanup(emotions: dict, reasons: dict):

@@ -21,4 +21,7 @@ from .user_profile import (
     delete_profile,
     record_message,
     extract_and_update,
+    add_exchange_to_buffer,
+    get_buffer_size,
+    flush_and_analyze,
 )

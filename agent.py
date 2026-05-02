@@ -1,25 +1,31 @@
 # agent.py
 import re
 import threading
+from dotenv import load_dotenv
+load_dotenv()  # 确保独立导入时也能拿到 API key
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_tool_calling_agent, AgentExecutor
+from llm_factory import get_llm
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from tools import get_weather, get_news
-from web_tools import web_search, web_fetch
-from image_tools import reverse_image_search
-from music_tools import play_music
-from mail_tools import send_email, check_emails, read_email
-from qzone_tools import (
+from tools.weather import get_weather, get_news
+from tools.web import web_search, web_fetch
+from tools.image import reverse_image_search
+from tools.music import play_music
+from tools.mail import send_email, check_emails, read_email
+from tools.qzone import (
     qzone_view_feeds, qzone_search_post,
     qzone_like_post, qzone_comment_post,
     qzone_publish_post, qzone_view_visitor, qzone_lookup_member,
     qzone_delete_post,
 )
+from tools.bilibili import search_bilibili_video, get_bilibili_hot, get_video_info
+from tools.meme import send_meme, search_meme
 
 
 # 全局 LLM 实例（线程安全，可共享）
-llm = ChatOpenAI(model="deepseek-v4-flash", temperature=0.3, max_tokens=2048,
-                 extra_body={"thinking": {"type": "disabled"}})
+# 高配模型：deepseek-reasoner（开思考模式），用于主对话回复和工具调用
+llm = get_llm(model="deepseek-reasoner", max_tokens=8192,
+                 timeout=60, max_retries=2)
 
 # 工具列表（线程安全，可共享）
 tools = [
@@ -30,6 +36,8 @@ tools = [
     qzone_like_post, qzone_comment_post,
     qzone_publish_post, qzone_view_visitor, qzone_lookup_member,
     qzone_delete_post,
+    search_bilibili_video, get_bilibili_hot, get_video_info,
+    send_meme, search_meme,
 ]
 
 # ========== 默认 system message（模块加载时读取） ==========

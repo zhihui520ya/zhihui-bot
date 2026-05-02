@@ -38,6 +38,18 @@ def _get_conn():
             updated_at TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_message_buffer (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            user_msg TEXT NOT NULL,
+            bot_reply TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_buffer_user_id ON user_message_buffer(user_id)
+    """)
     return conn
 
 
@@ -147,7 +159,99 @@ async def record_message(user_id: int):
         conn.close()
 
 
-# ========== LLM 提取 ==========
+# ========== 消息缓存（批量分析用） ==========
+
+# 每用户缓存多少轮对话后自动触发批量分析
+BUFFER_FLUSH_THRESHOLD = 20
+
+
+async def add_exchange_to_buffer(user_id: int, user_msg: str, bot_reply: str) -> int:
+    """缓存一轮对话到缓冲区。返回当前缓冲区大小（该用户的总缓存条数）。"""
+    now_str = datetime.datetime.utcnow().isoformat()
+    conn = _get_conn()
+    conn.execute(
+        "INSERT INTO user_message_buffer (user_id, user_msg, bot_reply, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, user_msg, bot_reply, now_str)
+    )
+    conn.commit()
+    count = conn.execute(
+        "SELECT COUNT(*) FROM user_message_buffer WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()[0]
+    conn.close()
+    return count
+
+
+async def get_buffer_size(user_id: int) -> int:
+    """获取该用户的缓冲区消息条数。"""
+    conn = _get_conn()
+    count = conn.execute(
+        "SELECT COUNT(*) FROM user_message_buffer WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()[0]
+    conn.close()
+    return count
+
+
+async def flush_and_analyze(user_id: int, llm: ChatOpenAI) -> bool:
+    """清空缓冲区并用所有缓存的对话批量分析用户画像。返回 True 表示画像有更新。"""
+    async with await _get_user_lock(user_id):
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT user_msg, bot_reply FROM user_message_buffer WHERE user_id = ? ORDER BY id",
+            (user_id,)
+        ).fetchall()
+        if not rows:
+            conn.close()
+            return False
+
+        # 构建完整对话文本
+        exchanges = []
+        for row in rows:
+            exchanges.append(f"用户: {row[0]}\n知慧: {row[1]}")
+        full_text = "\n\n---\n\n".join(exchanges)
+
+        # 清空缓冲区
+        conn.execute("DELETE FROM user_message_buffer WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+
+    # 读取当前画像
+    existing = await get_profile(user_id)
+    existing_json = json.dumps(existing, ensure_ascii=False) if existing else "{}"
+
+    prompt = _BATCH_PROFILE_EXTRACTION_PROMPT.format(
+        existing_profile=existing_json,
+        exchanges=full_text,
+    )
+
+    try:
+        response = await llm.ainvoke(prompt)
+        result_text = response.content.strip()
+        if result_text.startswith("```"):
+            result_text = result_text.split("\n", 1)[-1]
+            result_text = result_text.rsplit("```", 1)[0]
+        result = json.loads(result_text.strip())
+
+        if isinstance(result, dict) and result.get("updated"):
+            updates = {}
+            if "profile" in result:
+                updates.update(result["profile"])
+            if "_observations" in result:
+                updates["_observations"] = result["_observations"]
+
+            if updates:
+                async with await _get_user_lock(user_id):
+                    _merge_profile_no_lock(user_id, updates)
+                print(f"[画像] 批量分析更新: user_id={user_id}, 字段={list(updates.keys())}")
+                return True
+    except Exception as e:
+        print(f"[画像] 批量分析失败: {e}")
+
+    return False
+
+
+# ========== LLM 提取（单轮/兼容） ==========
 
 _PROFILE_EXTRACTION_PROMPT = """你是一个用户画像分析师。根据以下对话，提取或更新该用户的画像信息。
 
@@ -156,27 +260,73 @@ _PROFILE_EXTRACTION_PROMPT = """你是一个用户画像分析师。根据以下
 用户消息：{user_msg}
 AI 回复：{bot_reply}
 
-分析用户消息中是否有用户主动透露的个人信息。
-严格规则（非常重要）：
-1. 只提取用户消息中明确说出的关于TA自己的信息，例如"我叫XX""我今年X岁""我喜欢XX"。
-2. 不要从AI的回复推断用户的喜好。例如用户问"这是谁"，AI回答"这是银狼"——这不意味着用户喜欢银狼。
-3. 不要从聊天上下文推断用户特征。用户只是提了一个问题或发了一张图，不等于TA喜欢图中内容。
-4. 除非用户明确说了"我喜欢XX""我讨厌XX""我的XX是XX"，否则视为没有新信息。
-5. 如果用户消息只是一般提问、打招呼、发图、回复表情等日常对话，没有透露个人信息，返回 {"updated": false}。
+分析用户消息并提取信息。
 
-可能的画像字段（不限于这些）：
-- name: 用户称呼/昵称
+=== 个人信息（严格模式） ===
+只提取用户明确说的关于TA自己的事实：
+- name: 称呼/昵称
 - gender: 性别
 - age: 年龄
-- relationship: 与 AI 的关系描述
-- likes: 喜欢的事物（列表，仅当用户明确说自己喜欢时记录）
-- dislikes: 不喜欢的事物（列表，仅当用户明确说自己不喜欢时记录）
-- personality: 性格特征描述
-- facts: 其他事实（列表，仅当用户陈述关于自己的事实时记录）
-- preferences: 偏好（对象，仅当用户明确表达偏好时记录）
+- likes: 喜欢的事物（列表）
+- dislikes: 不喜欢的事物（列表）
+- personality: 性格特征
+- facts: 其他事实（列表）
+
+=== 行为观察（宽松模式） ===
+根据用户怎么说话，推断行为模式：
+- communication_style: 沟通风格（直接/委婉/幽默/简洁/话痨/理性/感性）
+- emotional_pattern: 情绪模式（稳定/敏感/热情/冷静/易怒/乐观）
+- attitude_to_bot: 对 bot 的态度（友好/随意/挑剔/依赖/客气/亲近）
+- typical_topics: 常聊话题（列表）
+- interaction_preference: 互动偏好（深度聊天/轻松闲聊/快速问答/工具使用）
+
+规则：
+- 个人信息：只提取用户明确说出的，没有就留空
+- 行为观察：根据整段对话的语气和风格推断，没有明显特征就留空
+- 只有本轮对话有新信息时才返回 {"updated": true}
 
 返回格式：
-{{"updated": true, "profile": {{"name": "小明", "age": "18", ...}}}}
+{{"updated": true, "profile": {{"name": "小明", "age": "18", "communication_style": "直接幽默"}}}}
+或
+{{"updated": false}}
+
+只返回 JSON，不要有其他文字。"""
+
+_BATCH_PROFILE_EXTRACTION_PROMPT = """你是一个用户画像分析师。根据以下多轮对话，提取或更新该用户的画像信息。
+
+当前画像：{existing_profile}
+
+以下是该用户的多轮对话记录：
+{exchanges}
+
+分析用户在所有这些对话中透露的信息。
+
+=== 个人信息（严格模式） ===
+只提取用户明确说的关于TA自己的事实：
+- name: 称呼/昵称
+- gender: 性别
+- age: 年龄
+- likes: 喜欢的事物（列表）
+- dislikes: 不喜欢的事物（列表）
+- personality: 性格特征
+- facts: 其他事实（列表）
+
+=== 行为观察（宽松模式） ===
+根据用户怎么说话，推断行为模式：
+- communication_style: 沟通风格（直接/委婉/幽默/简洁/话痨/理性/感性）
+- emotional_pattern: 情绪模式（稳定/敏感/热情/冷静/易怒/乐观）
+- attitude_to_bot: 对 bot 的态度（友好/随意/挑剔/依赖/客气/亲近）
+- typical_topics: 常聊话题（列表）
+- interaction_preference: 互动偏好（深度聊天/轻松闲聊/快速问答/工具使用）
+
+规则：
+- 个人信息：只提取用户明确说出的，没有就留空
+- 行为观察：根据所有对话的语气和风格推断，没有明显特征就留空
+- 结合新对话和当前画像，输出合并后的完整画像
+- 行为观察单独放在 _observations 字段中
+
+返回格式：
+{{"updated": true, "profile": {{"name": "小明", "age": "18"}}, "_observations": {{"communication_style": "直接幽默", "typical_topics": ["游戏", "音乐"]}}}}
 或
 {{"updated": false}}
 
@@ -188,17 +338,17 @@ async def extract_and_update(user_id: int, user_msg: str, bot_reply: str, llm: C
     if not user_id or not user_msg:
         return
 
-    async with await _get_user_lock(user_id):
-        existing = _get_profile_no_lock(user_id)
-
-    existing_json = json.dumps(existing, ensure_ascii=False) if existing else "{}"
-    prompt = _PROFILE_EXTRACTION_PROMPT.format(
-        existing_profile=existing_json,
-        user_msg=user_msg[:500],
-        bot_reply=bot_reply[:500],
-    )
-
     try:
+        async with await _get_user_lock(user_id):
+            existing = _get_profile_no_lock(user_id)
+
+        existing_json = json.dumps(existing, ensure_ascii=False) if existing else "{}"
+        prompt = _PROFILE_EXTRACTION_PROMPT.format(
+            existing_profile=existing_json,
+            user_msg=user_msg[:500],
+            bot_reply=bot_reply[:500],
+        )
+
         response = await llm.ainvoke(prompt)
         result_text = response.content.strip()
         # 清理可能的 markdown 代码块标记
@@ -207,14 +357,18 @@ async def extract_and_update(user_id: int, user_msg: str, bot_reply: str, llm: C
             result_text = result_text.rsplit("```", 1)[0]
         result = json.loads(result_text.strip())
 
-        if result.get("updated") and "profile" in result:
+        if isinstance(result, dict) and result.get("updated") and "profile" in result:
             updates = result["profile"]
             if isinstance(updates, dict) and updates:
                 async with await _get_user_lock(user_id):
                     _merge_profile_no_lock(user_id, updates)
                 print(f"[画像] 提取并更新: user_id={user_id}, 字段={list(updates.keys())}")
     except json.JSONDecodeError:
-        print(f"[画像] LLM 返回非 JSON，跳过提取: {result_text[:100]}")
+        print(f"[画像] LLM 返回非 JSON，跳过提取")
+    except (KeyError, AttributeError, TypeError) as _pe:
+        import traceback
+        print(f"[画像] 解析结果异常: {_pe}")
+        print(f"[画像] Traceback:\n{traceback.format_exc()}")
     except Exception as e:
         print(f"[画像] 提取失败: {e}")
 
